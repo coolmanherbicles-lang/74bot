@@ -195,9 +195,9 @@ async def comb_search(
     query: str,
 ) -> list[dict]:
     """
-    ProxyNova COMB search — queries the Collection Of Many Breaches dataset.
-    Returns parsed records: {line, email, password_masked, source_hint}
-    Free, no key required. Returns up to 100 lines.
+    ProxyNova COMB search — Collection Of Many Breaches.
+    Returns ALL credential lines, classified as email or username pairs.
+    No key required. Returns up to 100 lines.
     """
     try:
         async with session.get(
@@ -213,17 +213,26 @@ async def comb_search(
         return []
 
     records = []
+    total   = data.get("count", 0)
     for line in data.get("lines", [])[:100]:
-        if ":" not in line:
+        line = line.strip()
+        if not line:
             continue
-        parts    = line.split(":", 1)
-        email    = parts[0].strip()
-        password = parts[1].strip() if len(parts) > 1 else ""
+        if ":" in line:
+            left, right = line.split(":", 1)
+            left  = left.strip()
+            right = right.strip()
+        else:
+            left, right = line, ""
+
+        is_email = "@" in left and "." in left.split("@")[-1]
         records.append({
             "raw_line":        line,
-            "email":           email,
-            "password_masked": _mask_password(password),
-            "count":           data.get("count", 0),
+            "identifier":      left,          # email OR username OR discord-id
+            "is_email":        is_email,
+            "password_masked": _mask_password(right),
+            "raw_password":    right,          # kept internally for HIBP chaining
+            "count":           total,
         })
     return records
 
@@ -627,165 +636,154 @@ class OSINTCog(commands.Cog, name="OSINT"):
             except discord.Forbidden:
                 e.add_field(name="👤 Fetch", value="Forbidden — missing access", inline=False)
 
-            # ── Breach Intel (all sources, parallel) ─────────────────────────
+            # ── Breach Intel ──────────────────────────────────────────────────
+            # Search identifiers: username, display name, AND the raw Discord ID.
+            # Discord breach dumps store all three formats — username:pass,
+            # email:pass, and discordid:token. We search them all.
+            search_ids: list[str] = []
             if discord_username:
-                # Collect usernames to search — both handle and display name
-                targets = list({discord_username.lower(), (display_name or "").lower()} - {""})
+                search_ids.append(discord_username.lower())
+            if display_name and display_name.lower() not in search_ids:
+                search_ids.append(display_name.lower())
+            search_ids.append(user_id)   # raw snowflake — appears in Discord-specific dumps
 
-                # Fire COMB, BreachDirectory, and HIBP for every target name at once
-                all_tasks = []
-                for t in targets:
-                    all_tasks.append(comb_search(self._session, t))
-                    all_tasks.append(breachdirectory_search(self._session, t))
-                    all_tasks.append(username_breach_sweep(self._session, t))
+            # Fire COMB + BreachDirectory for every identifier in parallel,
+            # plus HIBP spray for any name-based targets.
+            all_tasks = []
+            for sid in search_ids:
+                all_tasks.append(comb_search(self._session, sid))
+                all_tasks.append(breachdirectory_search(self._session, sid))
+                # HIBP spray only makes sense for human-readable names, not the numeric ID
+                if not sid.isdigit():
+                    all_tasks.append(username_breach_sweep(self._session, sid))
+                else:
+                    all_tasks.append(asyncio.sleep(0))   # placeholder keeps indexing consistent
 
-                results = await asyncio.gather(*all_tasks)
+            raw_results = await asyncio.gather(*all_tasks)
 
-                # Reshape into per-target buckets
-                per_target: list[tuple[str, list, list, dict]] = []
-                for i, t in enumerate(targets):
-                    base          = i * 3
-                    comb_recs     = results[base]
-                    bd_recs       = results[base + 1]
-                    hibp_merged   = results[base + 2]
-                    per_target.append((t, comb_recs, bd_recs, hibp_merged))
+            # Reshape into per-identifier buckets
+            per_id: list[tuple[str, list, list, dict]] = []
+            for idx, sid in enumerate(search_ids):
+                base = idx * 3
+                per_id.append((
+                    sid,
+                    raw_results[base]     or [],   # COMB
+                    raw_results[base + 1] or [],   # BreachDirectory
+                    raw_results[base + 2] or {},   # HIBP spray
+                ))
 
-                total_hits = sum(
-                    len(c) + len(b) + len(h)
-                    for _, c, b, h in per_target
+            # ── Collect ALL credential records (emails AND username:pass) ────
+            # keyed by identifier (email or username) to dedupe across searches
+            cred_map: dict[str, dict] = {}   # identifier -> best record
+            for (sid, comb_recs, bd_recs, _) in per_id:
+                for rec in comb_recs:
+                    ident = rec.get("identifier", "").strip().lower()
+                    if ident and ident not in cred_map:
+                        cred_map[ident] = {
+                            "identifier":      ident,
+                            "is_email":        rec.get("is_email", False),
+                            "password_masked": rec.get("password_masked", "***"),
+                            "hash_type":       "",
+                            "source":          f"COMB (searched `{sid}`)",
+                            "comb_total":      rec.get("count", 0),
+                        }
+                for rec in bd_recs:
+                    ident = rec.get("email", rec.get("username", "")).strip().lower()
+                    if ident and ident not in cred_map:
+                        srcs = rec.get("sources", [])
+                        cred_map[ident] = {
+                            "identifier":      ident,
+                            "is_email":        "@" in ident,
+                            "password_masked": _mask_password(rec.get("password", rec.get("hash", ""))),
+                            "hash_type":       rec.get("hash_type", ""),
+                            "source":          f"BreachDirectory — {', '.join(srcs[:3]) if isinstance(srcs, list) else srcs}",
+                            "comb_total":      0,
+                        }
+
+            # ── HIBP-check every email found in the credential records ────────
+            leaked_emails = [v["identifier"] for v in cred_map.values() if v["is_email"]][:20]
+            if leaked_emails:
+                hibp_results = await asyncio.gather(
+                    *[hibp_email_breach(self._session, em) for em in leaked_emails]
                 )
+            else:
+                hibp_results = []
 
+            email_hibp: dict[str, tuple[list, list]] = {
+                em: res for em, res in zip(leaked_emails, hibp_results)
+            }
+
+            # HIBP spray fallback for non-email creds (e.g. username-only hits)
+            all_spray: dict[str, dict] = {}
+            for (_, __, ___, hibp_merged) in per_id:
+                for k, v in hibp_merged.items():
+                    matched = v.get("_matched_email", "").lower()
+                    if k not in all_spray and matched not in cred_map:
+                        all_spray[k] = v
+
+            total_records = len(cred_map) + len(all_spray)
+
+            e.add_field(
+                name="\u200b",
+                value=(
+                    f"**── 🔥 Breach Intelligence ──**\n"
+                    f"Sources: COMB · BreachDirectory · HIBP\n"
+                    f"Searched: `{'`, `'.join(search_ids)}`\n"
+                    f"Credential records found: **{len(cred_map)}** "
+                    f"({len(leaked_emails)} emails, {len(cred_map) - len(leaked_emails)} username/ID pairs)"
+                ),
+                inline=False,
+            )
+
+            if total_records == 0:
                 e.add_field(
-                    name="\u200b",
-                    value=f"**── 🔥 Breach Intelligence ──**\nSources: COMB · BreachDirectory · HIBP\n"
-                          f"Targets searched: `{'`, `'.join(targets)}`",
+                    name="✅ All Clear",
+                    value="No records found across COMB, BreachDirectory, or HIBP for this user.",
                     inline=False,
                 )
+            else:
+                e.color = discord.Color.red()
 
-                # ── Collect all real emails found in COMB + BreachDirectory ──────
-                # email -> {password_masked, hash_type, sources}
-                leaked_email_map: dict[str, dict] = {}
-                for (target, comb_recs, bd_recs, _) in per_target:
-                    for rec in comb_recs:
-                        em = rec.get("email", "").strip().lower()
-                        if em and "@" in em and em not in leaked_email_map:
-                            leaked_email_map[em] = {
-                                "password_masked": rec.get("password_masked", "***"),
-                                "source":          "COMB",
-                                "hash_type":       "",
-                            }
-                    for rec in bd_recs:
-                        em = rec.get("email", rec.get("username", "")).strip().lower()
-                        if em and "@" in em and em not in leaked_email_map:
-                            leaked_email_map[em] = {
-                                "password_masked": _mask_password(rec.get("password", rec.get("hash", ""))),
-                                "source":          "BreachDirectory",
-                                "hash_type":       rec.get("hash_type", ""),
-                            }
+                # ── Show each credential record + HIBP breach chain ───────────
+                for cred in list(cred_map.values())[:25]:
+                    ident  = cred["identifier"]
+                    pw     = cred["password_masked"]
+                    ht     = cred.get("hash_type", "")
+                    source = cred["source"]
+                    total  = cred.get("comb_total", 0)
 
-                # ── HIBP breach each leaked email concurrently ────────────────
-                unique_emails = list(leaked_email_map.keys())[:20]   # cap at 20 to stay within embed limits
-                if unique_emails:
-                    hibp_per_email = await asyncio.gather(
-                        *[hibp_email_breach(self._session, em) for em in unique_emails]
-                    )
-                else:
-                    hibp_per_email = []
+                    pw_str = f"🔑 pw: `{pw}`" + (f" `[{ht}]`" if ht else "") + f" · via {source}"
+                    if total:
+                        pw_str += f" · {total:,} records in DB"
 
-                # Merge email-level results with HIBP findings
-                # Structure: {email: {meta, breaches: [...], pastes: [...]}}
-                email_intel: list[dict] = []
-                for em, (hibp_breaches, hibp_pastes) in zip(unique_emails, hibp_per_email):
-                    meta = leaked_email_map[em]
-                    email_intel.append({
-                        "email":    em,
-                        "meta":     meta,
-                        "breaches": hibp_breaches,
-                        "pastes":   hibp_pastes,
-                    })
-
-                # Also pull any HIBP spray hits for emails not in the real-leak set
-                all_hibp_merged: dict[str, dict] = {}
-                for (_, __, ___, hibp_merged) in per_target:
-                    for k, v in hibp_merged.items():
-                        if k not in all_hibp_merged:
-                            # Only include if the matched email isn't already in our real set
-                            matched = v.get("_matched_email", "")
-                            if matched.lower() not in leaked_email_map:
-                                all_hibp_merged[k] = v
-
-                total_hits = len(leaked_email_map) + sum(len(x["breaches"]) for x in email_intel) + len(all_hibp_merged)
-
-                e.add_field(
-                    name="\u200b",
-                    value=f"**── 🔥 Breach Intelligence ──**\nSources: COMB · BreachDirectory · HIBP\n"
-                          f"Targets searched: `{'`, `'.join(targets)}`\n"
-                          f"Real emails found in leaks: `{len(unique_emails)}`",
-                    inline=False,
-                )
-
-                if total_hits == 0 and not leaked_email_map:
-                    e.add_field(
-                        name="✅ All Clear",
-                        value="No records found across COMB, BreachDirectory, or HIBP for any username variant.",
-                        inline=False,
-                    )
-                else:
-                    # ── Display each leaked email + its HIBP breach chain ──────
-                    if email_intel:
-                        e.color = discord.Color.red()
-                        for ei in email_intel:
-                            em       = ei["email"]
-                            meta     = ei["meta"]
-                            breaches = ei["breaches"]
-                            pastes   = ei["pastes"]
-
-                            # Build the per-email field value
-                            pw_line  = f"🔑 Leaked pw: `{meta['password_masked']}`"
-                            if meta.get("hash_type"):
-                                pw_line += f" `[{meta['hash_type']}]`"
-                            pw_line += f" via `{meta['source']}`"
-
-                            if breaches:
-                                breach_names = ", ".join(
-                                    f"`{b.get('Name','?')}`" for b in
-                                    sorted(breaches, key=lambda x: x.get("BreachDate",""), reverse=True)[:8]
-                                )
-                                data_classes = sorted({c for b in breaches for c in b.get("DataClasses",[])})
-                                breach_line  = f"💀 In **{len(breaches)}** breach(es): {breach_names}"
-                                if data_classes:
-                                    breach_line += f"\n📦 Data exposed: {', '.join(data_classes[:12])}"
-                            else:
-                                breach_line = "✅ Not in HIBP breach database"
-
-                            paste_line = f"📋 In **{len(pastes)}** paste(s)" if pastes else ""
-
-                            value = pw_line + "\n" + breach_line
-                            if paste_line:
-                                value += "\n" + paste_line
-
-                            e.add_field(
-                                name=f"📧 {em}",
-                                value=value[:1024],
-                                inline=False,
+                    if cred["is_email"] and ident in email_hibp:
+                        breaches, pastes = email_hibp[ident]
+                        if breaches:
+                            names = ", ".join(
+                                f"`{b.get('Name','?')}`"
+                                for b in sorted(breaches, key=lambda x: x.get("BreachDate",""), reverse=True)[:10]
                             )
-
-                    elif leaked_email_map and not HIBP_API_KEY:
-                        # We found emails but can't HIBP check — show them raw
-                        lines = []
-                        for em, meta in leaked_email_map.items():
-                            lines.append(f"`{em}` — pw: `{meta['password_masked']}` via `{meta['source']}`")
-                        for i2, chunk in enumerate(chunk_field(lines)):
-                            e.add_field(
-                                name=f"💀 Leaked Emails ({len(leaked_email_map)}) — add HIBP_API_KEY for breach chain" if i2 == 0 else "↳",
-                                value=chunk, inline=False,
+                            classes = sorted({c for b in breaches for c in b.get("DataClasses", [])})
+                            breach_str = (
+                                f"💀 **{len(breaches)} breach(es):** {names}\n"
+                                f"📦 Exposed: {', '.join(classes[:15])}"
                             )
-                        e.color = discord.Color.orange()
+                        else:
+                            breach_str = "✅ Not found in HIBP"
+                        paste_str = f"\n📋 **{len(pastes)} paste(s)**" if pastes else ""
+                        field_val = f"{pw_str}\n{breach_str}{paste_str}"
+                        icon = "📧"
+                    else:
+                        # username:pass or discordid:token — no HIBP email lookup possible
+                        field_val = pw_str
+                        icon = "🎮" if ident.isdigit() else "👤"
 
-                    # ── HIBP spray results for emails not in real-leak set ─────
-                    if all_hibp_merged:
-                        e.add_field(name="\u200b", value="**── HIBP Email Spray (combo hits) ──**", inline=False)
-                        render_breach_fields(e, all_hibp_merged)
+                    e.add_field(name=f"{icon} `{ident}`", value=field_val[:1024], inline=False)
+
+                # ── HIBP spray fallback section ───────────────────────────────
+                if all_spray:
+                    e.add_field(name="\u200b", value="**── HIBP Email Spray (additional combo hits) ──**", inline=False)
+                    render_breach_fields(e, all_spray)
 
         except ValueError:
             e.description = "❌ Not a valid snowflake integer"
