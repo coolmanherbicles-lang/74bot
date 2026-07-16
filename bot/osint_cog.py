@@ -182,14 +182,84 @@ async def probe_platform(
 
 # ─── SHARED BREACH ENGINE ─────────────────────────────────────────────────────
 
+def _mask_password(pw: str) -> str:
+    """Show first 2 chars then asterisks — enough to confirm a leak without exposing it."""
+    if not pw:
+        return "***"
+    visible = min(2, len(pw))
+    return pw[:visible] + "*" * max(3, len(pw) - visible)
+
+
+async def comb_search(
+    session: aiohttp.ClientSession,
+    query: str,
+) -> list[dict]:
+    """
+    ProxyNova COMB search — queries the Collection Of Many Breaches dataset.
+    Returns parsed records: {line, email, password_masked, source_hint}
+    Free, no key required. Returns up to 100 lines.
+    """
+    try:
+        async with session.get(
+            f"https://api.proxynova.com/comb?query={urllib.parse.quote(query)}",
+            headers={"User-Agent": "AxiomOSINT/3.0"},
+            timeout=aiohttp.ClientTimeout(total=12),
+            ssl=False,
+        ) as r:
+            if r.status != 200:
+                return []
+            data = await r.json(content_type=None)
+    except Exception:
+        return []
+
+    records = []
+    for line in data.get("lines", [])[:100]:
+        if ":" not in line:
+            continue
+        parts    = line.split(":", 1)
+        email    = parts[0].strip()
+        password = parts[1].strip() if len(parts) > 1 else ""
+        records.append({
+            "raw_line":        line,
+            "email":           email,
+            "password_masked": _mask_password(password),
+            "count":           data.get("count", 0),
+        })
+    return records
+
+
+async def breachdirectory_search(
+    session: aiohttp.ClientSession,
+    query: str,
+) -> list[dict]:
+    """
+    BreachDirectory free API — searches by username or email.
+    Returns list of {email, password, sources, hash_type}.
+    No key needed for basic queries.
+    """
+    try:
+        async with session.get(
+            f"https://breachdirectory.p.rapidapi.com/?func=auto&term={urllib.parse.quote(query)}",
+            headers={
+                "User-Agent":          "AxiomOSINT/3.0",
+                "X-RapidAPI-Host":     "breachdirectory.p.rapidapi.com",
+                "X-RapidAPI-Key":      os.getenv("RAPIDAPI_KEY", ""),
+            },
+            timeout=aiohttp.ClientTimeout(total=10),
+            ssl=False,
+        ) as r:
+            if r.status != 200:
+                return []
+            return (await r.json(content_type=None)).get("result", [])
+    except Exception:
+        return []
+
+
 async def hibp_email_breach(
     session: aiohttp.ClientSession,
     email: str,
 ) -> tuple[list[dict], list[dict]]:
-    """
-    Returns (breaches, pastes) for a single email address.
-    Both lists are empty if HIBP key is missing or the address is clean.
-    """
+    """Returns (breaches, pastes) for a single email via HIBP."""
     if not HIBP_API_KEY:
         return [], []
     hd = HIBP_HEADERS()
@@ -209,20 +279,13 @@ async def username_breach_sweep(
     session: aiohttp.ClientSession,
     username: str,
 ) -> dict[str, dict]:
-    """
-    Spray username@<common_domain> against HIBP concurrently.
-    Returns a deduplicated dict of breach_name -> breach_record.
-    Also includes paste hits keyed by 'PASTE:source'.
-    """
+    """HIBP email spray: username@common_domains. Returns deduped breach dict."""
     if not HIBP_API_KEY:
         return {}
-
     emails  = [f"{username}@{d}" for d in BREACH_EMAIL_DOMAINS]
-    tasks   = [hibp_email_breach(session, em) for em in emails]
-    results = await asyncio.gather(*tasks)
-
+    results = await asyncio.gather(*[hibp_email_breach(session, em) for em in emails])
     merged: dict[str, dict] = {}
-    for (email, (breaches, pastes)) in zip(emails, results):
+    for email, (breaches, pastes) in zip(emails, results):
         for b in breaches:
             name = b.get("Name", "?")
             if name not in merged:
@@ -232,16 +295,32 @@ async def username_breach_sweep(
             key = f"PASTE:{p.get('Source','?')}:{p.get('Id','')}"
             if key not in merged:
                 p["_matched_email"] = email
-                p["_is_paste"] = True
-                merged[key] = p
+                p["_is_paste"]      = True
+                merged[key]         = p
     return merged
 
 
+async def full_username_breach_intel(
+    session: aiohttp.ClientSession,
+    username: str,
+) -> tuple[list[dict], list[dict], dict[str, dict]]:
+    """
+    Runs all three breach sources concurrently for a username:
+      - ProxyNova COMB (real leaked lines)
+      - BreachDirectory (structured records)
+      - HIBP email spray (named breach sources)
+    Returns (comb_records, bd_records, hibp_merged)
+    """
+    comb, bd, hibp = await asyncio.gather(
+        comb_search(session, username),
+        breachdirectory_search(session, username),
+        username_breach_sweep(session, username),
+    )
+    return comb, bd, hibp
+
+
 def render_breach_fields(e: discord.Embed, merged: dict[str, dict], label_prefix: str = "") -> None:
-    """
-    Attach breach + paste fields to an embed from a username_breach_sweep result.
-    Does nothing if merged is empty.
-    """
+    """Attach HIBP breach + paste fields to an embed."""
     breaches = {k: v for k, v in merged.items() if not v.get("_is_paste")}
     pastes   = {k: v for k, v in merged.items() if v.get("_is_paste")}
 
@@ -502,14 +581,14 @@ class OSINTCog(commands.Cog, name="OSINT"):
         await interaction.followup.send(embed=e)
 
     # ── /discordid ────────────────────────────────────────────────────────────
-    @app_commands.command(name="discordid", description="Snowflake decode + user lookup + breach sweep on username")
+    @app_commands.command(name="discordid", description="Snowflake decode + full breach intel — COMB, BreachDirectory, HIBP")
     @app_commands.describe(user_id="Discord snowflake ID")
     @_installs
     @_contexts
     @whitelist_check()
     async def discordid_lookup(self, interaction: discord.Interaction, user_id: str):
         await interaction.response.defer(thinking=True)
-        e = build_embed(f"Discord Snowflake — {user_id}")
+        e = build_embed(f"Discord ID — {user_id}")
 
         try:
             sf         = int(user_id)
@@ -526,15 +605,19 @@ class OSINTCog(commands.Cog, name="OSINT"):
             e.add_field(name="📅 Unix MS",   value=f"`{ts_ms}`", inline=True)
             e.add_field(name="🔢 Binary",    value=f"```{binary[:32]}\n{binary[32:]}```", inline=False)
 
-            # Fetch user from Discord API
+            # ── Fetch Discord user ────────────────────────────────────────────
             discord_username = None
+            display_name     = None
+            user             = None
             try:
-                user = await interaction.client.fetch_user(sf)
-                discord_username = user.name   # the new username format (no discriminator)
-                e.add_field(name="👤 Tag",    value=f"`{user}`",                         inline=True)
-                e.add_field(name="🤖 Bot",    value=f"`{user.bot}`",                     inline=True)
-                e.add_field(name="🖼️ Avatar", value=f"[Open]({user.display_avatar.url})", inline=True)
-                e.add_field(name="💎 Hash",   value=f"`{user.avatar.key if user.avatar else 'default'}`", inline=True)
+                user             = await interaction.client.fetch_user(sf)
+                discord_username = user.name
+                display_name     = user.global_name or user.name
+                e.add_field(name="👤 Username",     value=f"`{user}`",                          inline=True)
+                e.add_field(name="📛 Display Name", value=f"`{display_name}`",                  inline=True)
+                e.add_field(name="🤖 Bot",          value=f"`{user.bot}`",                      inline=True)
+                e.add_field(name="🖼️ Avatar",       value=f"[Open]({user.display_avatar.url})", inline=True)
+                e.add_field(name="💎 Avatar Hash",  value=f"`{user.avatar.key if user.avatar else 'default'}`", inline=True)
                 if user.banner:
                     e.add_field(name="🎨 Banner", value=f"[Open]({user.banner.url})", inline=True)
                 e.set_thumbnail(url=user.display_avatar.url)
@@ -544,28 +627,104 @@ class OSINTCog(commands.Cog, name="OSINT"):
             except discord.Forbidden:
                 e.add_field(name="👤 Fetch", value="Forbidden — missing access", inline=False)
 
-            # Breach sweep on the Discord username
+            # ── Breach Intel (all sources, parallel) ─────────────────────────
             if discord_username:
-                sweep = await username_breach_sweep(self._session, discord_username)
-                e.add_field(name="\u200b",
-                    value=f"**── Breach Sweep on `{discord_username}` ──**", inline=False)
-                if sweep:
-                    render_breach_fields(e, sweep)
-                else:
-                    e.add_field(name="✅ Breach Sweep",
-                        value=f"No breaches found for `{discord_username}@<common_domains>`", inline=False)
+                # Collect usernames to search — both handle and display name
+                targets = list({discord_username.lower(), (display_name or "").lower()} - {""})
 
-                # Also try legacy display name if different
-                try:
-                    if user.global_name and user.global_name.lower() != discord_username.lower():
-                        gn_sweep = await username_breach_sweep(self._session, user.global_name)
-                        if gn_sweep:
-                            e.add_field(name="\u200b",
-                                value=f"**── Breach Sweep on display name `{user.global_name}` ──**",
-                                inline=False)
-                            render_breach_fields(e, gn_sweep, label_prefix="Display")
-                except Exception:
-                    pass
+                # Fire COMB, BreachDirectory, and HIBP for every target name at once
+                all_tasks = []
+                for t in targets:
+                    all_tasks.append(comb_search(self._session, t))
+                    all_tasks.append(breachdirectory_search(self._session, t))
+                    all_tasks.append(username_breach_sweep(self._session, t))
+
+                results = await asyncio.gather(*all_tasks)
+
+                # Reshape into per-target buckets
+                per_target: list[tuple[str, list, list, dict]] = []
+                for i, t in enumerate(targets):
+                    base          = i * 3
+                    comb_recs     = results[base]
+                    bd_recs       = results[base + 1]
+                    hibp_merged   = results[base + 2]
+                    per_target.append((t, comb_recs, bd_recs, hibp_merged))
+
+                total_hits = sum(
+                    len(c) + len(b) + len(h)
+                    for _, c, b, h in per_target
+                )
+
+                e.add_field(
+                    name="\u200b",
+                    value=f"**── 🔥 Breach Intelligence ──**\nSources: COMB · BreachDirectory · HIBP\n"
+                          f"Targets searched: `{'`, `'.join(targets)}`",
+                    inline=False,
+                )
+
+                if total_hits == 0:
+                    e.add_field(
+                        name="✅ All Clear",
+                        value="No records found across COMB, BreachDirectory, or HIBP for any username variant.",
+                        inline=False,
+                    )
+                else:
+                    for (target, comb_recs, bd_recs, hibp_merged) in per_target:
+                        target_hits = len(comb_recs) + len(bd_recs) + len(hibp_merged)
+                        if target_hits == 0:
+                            continue
+
+                        e.add_field(
+                            name=f"🎯 Target: `{target}`",
+                            value=f"COMB hits: `{len(comb_recs)}` | BreachDir hits: `{len(bd_recs)}` | HIBP named breaches: `{len([x for x in hibp_merged if not hibp_merged[x].get('_is_paste')])}`",
+                            inline=False,
+                        )
+
+                        # ① COMB — real leaked credential lines
+                        if comb_recs:
+                            total_in_db = comb_recs[0].get("count", 0)
+                            lines = []
+                            seen_emails: set[str] = set()
+                            for rec in comb_recs[:20]:
+                                em = rec.get("email", "")
+                                pw = rec.get("password_masked", "***")
+                                if em in seen_emails:
+                                    continue
+                                seen_emails.add(em)
+                                lines.append(f"`{em}` — pw: `{pw}`")
+                            for i2, chunk in enumerate(chunk_field(lines)):
+                                e.add_field(
+                                    name=f"💀 COMB Leaked Records ({total_in_db:,} total in DB)" if i2 == 0 else "↳ COMB continued",
+                                    value=chunk,
+                                    inline=False,
+                                )
+                            e.color = discord.Color.red()
+
+                        # ② BreachDirectory — structured breach records
+                        if bd_recs:
+                            lines = []
+                            for rec in bd_recs[:15]:
+                                em   = rec.get("email", rec.get("username", "?"))
+                                pw   = _mask_password(rec.get("password", rec.get("hash", "")))
+                                src  = rec.get("sources", ["?"])
+                                srcs = ", ".join(src[:3]) if isinstance(src, list) else str(src)
+                                ht   = rec.get("hash_type", "")
+                                lines.append(
+                                    f"`{em}` — pw: `{pw}`"
+                                    + (f" `[{ht}]`" if ht else "")
+                                    + f"\n  └ Sources: {srcs}"
+                                )
+                            for i2, chunk in enumerate(chunk_field(lines)):
+                                e.add_field(
+                                    name=f"🔓 BreachDirectory Records ({len(bd_recs)})" if i2 == 0 else "↳ BD continued",
+                                    value=chunk,
+                                    inline=False,
+                                )
+                            e.color = discord.Color.red()
+
+                        # ③ HIBP named breaches + pastes
+                        if hibp_merged:
+                            render_breach_fields(e, hibp_merged, label_prefix=f"[{target}]")
 
         except ValueError:
             e.description = "❌ Not a valid snowflake integer"
