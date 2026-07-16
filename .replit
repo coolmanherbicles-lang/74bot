@@ -42,3 +42,8 @@ timeoutMs = 20000
 [nix]
 channel = "stable-25_05"
 packages = ["iana-etc"]
+
+[userenv]
+
+[userenv.shared]
+BOT_OWNER_ID = "1444462132321194154"

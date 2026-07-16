@@ -1,7 +1,7 @@
 """
 main.py — Axiom Bot runtime
 Auto-reconnects on disconnect, exponential backoff on repeated failures,
-clean SIGTERM/SIGINT shutdown. Runs like a partial VM — stays alive.
+clean SIGTERM/SIGINT shutdown.
 """
 
 import discord
@@ -20,19 +20,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("axiom")
 
-TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+TOKEN    = os.environ["DISCORD_BOT_TOKEN"]
+OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "0"))
 
-# ─── SHUTDOWN SIGNAL ──────────────────────────────────────────────────────────
 _shutdown = asyncio.Event()
 
 def _handle_signal(sig, frame):
-    log.info(f"Signal {sig} received — shutting down cleanly.")
+    log.info(f"Signal {sig} — shutting down.")
     _shutdown.set()
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT,  _handle_signal)
 
-# ─── BOT FACTORY ──────────────────────────────────────────────────────────────
 
 def make_bot() -> commands.Bot:
     intents = discord.Intents.default()
@@ -44,12 +43,12 @@ def make_bot() -> commands.Bot:
         try:
             synced = await bot.tree.sync()
             log.info(f"Logged in as {bot.user}  |  Synced {len(synced)} slash commands")
-        except Exception as e:
-            log.error(f"Command sync failed: {e}")
+        except Exception as ex:
+            log.error(f"Sync failed: {ex}")
 
     @bot.event
     async def on_disconnect():
-        log.warning("Bot disconnected from Discord — runtime will reconnect.")
+        log.warning("Disconnected — will reconnect.")
 
     @bot.event
     async def on_resumed():
@@ -57,35 +56,32 @@ def make_bot() -> commands.Bot:
 
     @bot.event
     async def on_error(event, *args, **kwargs):
-        log.exception(f"Unhandled error in event {event}")
+        log.exception(f"Unhandled error in {event}")
 
     return bot
 
-# ─── MAIN LOOP WITH BACKOFF ────────────────────────────────────────────────────
 
 async def run():
-    attempt       = 0
-    max_backoff   = 120   # seconds
-    base_backoff  = 5
+    attempt, base_backoff, max_backoff = 0, 5, 120
 
     while not _shutdown.is_set():
         bot = make_bot()
+        start = time.monotonic()
         try:
             await bot.load_extension("osint_cog")
+            await bot.load_extension("whitelist_cog")
             log.info(f"Starting bot (attempt {attempt + 1})")
-            start = time.monotonic()
             await bot.start(TOKEN)
-            # If start() returns cleanly, Discord closed the connection
         except discord.LoginFailure:
-            log.critical("Invalid bot token — check DISCORD_BOT_TOKEN secret. Exiting.")
+            log.critical("Invalid token — check DISCORD_BOT_TOKEN. Exiting.")
             sys.exit(1)
         except discord.PrivilegedIntentsRequired:
-            log.critical("Privileged intents not enabled in Discord Developer Portal. Exiting.")
+            log.critical("Privileged intents not enabled in Dev Portal. Exiting.")
             sys.exit(1)
-        except (discord.HTTPException, discord.GatewayNotFound, OSError) as e:
-            log.error(f"Connection error: {e}")
-        except Exception as e:
-            log.exception(f"Unexpected error: {e}")
+        except (discord.HTTPException, discord.GatewayNotFound, OSError) as ex:
+            log.error(f"Connection error: {ex}")
+        except Exception as ex:
+            log.exception(f"Unexpected error: {ex}")
         finally:
             if not bot.is_closed():
                 await bot.close()
@@ -93,20 +89,19 @@ async def run():
         if _shutdown.is_set():
             break
 
-        uptime = time.monotonic() - start
-        if uptime > 300:
-            # Was up for >5 min — reset backoff
+        if time.monotonic() - start > 300:
             attempt = 0
 
         wait = min(base_backoff * (2 ** attempt), max_backoff)
         attempt += 1
-        log.info(f"Reconnecting in {wait:.0f}s (attempt {attempt})...")
+        log.info(f"Reconnecting in {wait:.0f}s (attempt {attempt})…")
         try:
             await asyncio.wait_for(_shutdown.wait(), timeout=wait)
         except asyncio.TimeoutError:
-            pass   # timeout expired — loop and reconnect
+            pass
 
-    log.info("Axiom bot shut down cleanly.")
+    log.info("Axiom shut down cleanly.")
+
 
 if __name__ == "__main__":
     asyncio.run(run())
