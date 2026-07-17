@@ -1,0 +1,9 @@
+node_modules
+artifacts
+lib
+.local
+.agents
+attached_assets
+nixpacks.toml
+*.log
+.git
