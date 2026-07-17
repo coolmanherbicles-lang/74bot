@@ -1,0 +1,27 @@
+kind = "web"
+previewPath = "/"
+title = "74bot Dashboard"
+version = "1.0.0"
+id = "artifacts/bot-dashboard"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25712
+
+[services.development]
+run = "pnpm --filter @workspace/bot-dashboard run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/bot-dashboard", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/bot-dashboard/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25712"
+BASE_PATH = "/"
